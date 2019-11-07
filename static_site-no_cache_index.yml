@@ -1,0 +1,373 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: 'Static site with no cache on index.html'
+
+Parameters:
+#### Stack
+  ApplicationName:
+    Description: 'The Application name'
+    Type: String
+  EnvType:
+    Type: String
+    Description: 'The type of environment to create.'
+    Default: dev
+    AllowedValues:
+      - dev
+      - stg
+      - prod
+    ConstraintDescription: must specify prod, stg or dev.
+#### Route53
+  HostedZone:
+    Type: String
+    Description: The DNS name of an existing Amazon Route 53 hosted zone
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: must be a valid DNS zone name.
+  FullDomainName:
+    Description: 'The full domain name'
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    Type: String
+#### CloudFront
+  CertificateArn:
+    Description: the Amazon Resource Name (ARN) of an AWS Certificate Manager (ACM) certificate.
+    Type: String
+    AllowedPattern: "arn:aws:acm:.*"
+#### Github
+  GithubOwner:
+    Description: 'Github Organization name'
+    Type: String
+  GithubToken:
+    Description: 'Github OAuth Token with full permissions on admin:repo_hook and repo'
+    Type: String
+    NoEcho: true
+  GithubRepo:
+    Description: 'GitHub repository name'
+    Type: String
+  GithubBranch:
+    Description: 'GitHub branch name'
+    Type: String
+
+Resources:
+#### S3
+  WebSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub james-website-${AWS::StackName}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Delete
+
+  WebsiteBucketBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    DependsOn: WebSiteBucket
+    Properties:
+      Bucket: !Ref WebSiteBucket
+      PolicyDocument:
+        Statement:
+        - Action: "s3:Get*"
+          Effect: Allow
+          Resource: !Sub arn:aws:s3:::james-website-${AWS::StackName}/*
+          Principal:
+            CanonicalUser: !GetAtt OriginAccessIdentity.S3CanonicalUserId
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub james-logs-${AWS::StackName}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Delete
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub james-artifacts-${AWS::StackName}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Delete
+
+  ArtifactsBucketBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Join
+              - ''
+              - - !GetAtt
+                  - ArtifactsBucket
+                  - Arn
+                - /*
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: !Join
+              - ''
+              - - !GetAtt
+                  - ArtifactsBucket
+                  - Arn
+                - /*
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+##### CloudFront
+
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub ${FullDomainName} Origin Access Identity
+  WebsiteCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: CDN for S3-backed website
+        Aliases:
+          - !Ref FullDomainName
+        DefaultRootObject: index.html
+        Origins:
+          - DomainName: !Sub james-website-${AWS::StackName}.s3.amazonaws.com
+            Id: !Ref WebSiteBucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Join ["", ["origin-access-identity/cloudfront/", !Ref OriginAccessIdentity]]
+        Enabled: 'true'
+        CustomErrorResponses:
+        - ErrorCode: 404
+          ErrorCachingMinTTL: 5
+          ResponseCode: 200
+          ResponsePagePath: /index.html
+        - ErrorCode: 403
+          ErrorCachingMinTTL: 5
+          ResponseCode: 200
+          ResponsePagePath: /index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: !Ref WebSiteBucket
+          ForwardedValues:
+            QueryString: 'true'
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: allow-all
+        PriceClass: PriceClass_All
+        CacheBehaviors:
+        - AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: !Ref WebSiteBucket
+          PathPattern: /index.html
+          MinTTL: 0
+          MaxTTL: 1
+          DefaultTTL: 0
+          ForwardedValues:
+            QueryString: 'true'
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: allow-all
+        ViewerCertificate:
+          SslSupportMethod: sni-only
+          AcmCertificateArn: !Ref CertificateArn
+    DependsOn: WebSiteBucket
+#### Route 53
+  WebsiteDNSName:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName:  !Join ['', [!Ref 'HostedZone', .]]
+      Comment: CNAME redirect custom name to CloudFront distribution
+      Name: !Ref FullDomainName
+      Type: CNAME
+      TTL: '900'
+      ResourceRecords:
+      - !GetAtt [WebsiteCDN, DomainName]
+#### Codepipeline
+  AppPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: !Ref ApplicationName
+      RoleArn: !GetAtt
+        - CodePipelineServiceRole
+        - Arn
+      ArtifactStore:
+        Location: !Ref ArtifactsBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceGithub
+              ActionTypeId:
+                  Category: Source
+                  Owner: ThirdParty
+                  Provider: GitHub
+                  Version: '1'
+              Configuration:
+                  Owner: !Ref GithubOwner
+                  Repo: !Ref GithubRepo
+                  Branch: !Ref GithubBranch
+                  OAuthToken: !Ref GithubToken
+              OutputArtifacts:
+                - Name: SourceCodeAsZip
+              RunOrder: 1
+        - Name: WebsiteBuild
+          Actions:
+            - Name: WebsiteCodeBuild
+              ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+              Configuration:
+                  ProjectName: !Ref WebsiteCodeBuildProject
+                  PrimarySource: SourceCodeAsZip
+              InputArtifacts:
+                - Name: SourceCodeAsZip
+              OutputArtifacts:
+                - Name: WebsiteBuildArtifactAsZip
+              RunOrder: 2
+        - Name: WebsiteDeploy
+          Actions:
+            - Name: WebsiteBucket
+              ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: S3
+                  Version: '1'
+              Configuration:
+                  BucketName: !Ref WebSiteBucket
+                  Extract: true
+              InputArtifacts:
+                - Name: WebsiteBuildArtifactAsZip
+              RunOrder: 3
+
+#### CodeBuild
+  WebsiteCodeBuildProject:
+      Type: AWS::CodeBuild::Project
+      Properties:
+          ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+          Source:
+              Type: CODEPIPELINE
+          Artifacts:
+              Type: CODEPIPELINE
+          Environment:
+              Type: LINUX_CONTAINER
+              ComputeType: BUILD_GENERAL1_SMALL
+              Image: aws/codebuild/standard:2.0
+          Cache:
+              Type: S3
+              Location: !Sub james-artifacts-${AWS::StackName}
+
+
+#### IAM
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: {Service: ['codebuild.amazonaws.com']}
+              Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AWS-CodeBuild-Service
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codebuild:*'
+                  - 'codecommit:*'
+                  - 'iam:PassRole'
+                  - 'cloudwatch:*'
+                  - 's3:*'
+                  - 'logs:*'
+                Resource: '*'
+
+  CodePipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWS-CodePipeline-Service
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'devicefarm:ListProjects'
+                  - 'devicefarm:ListDevicePools'
+                  - 'devicefarm:GetRun'
+                  - 'devicefarm:GetUpload'
+                  - 'devicefarm:CreateUpload'
+                  - 'devicefarm:ScheduleRun'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:ListFunctions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'elasticbeanstalk:*'
+                  - 'ec2:*'
+                  - 'elasticloadbalancing:*'
+                  - 'autoscaling:*'
+                  - 'cloudwatch:*'
+                  - 's3:*'
+                  - 'sns:*'
+                  - 'cloudformation:*'
+                  - 'rds:*'
+                  - 'sqs:*'
+                  - 'ecs:*'
+                Resource: '*'
